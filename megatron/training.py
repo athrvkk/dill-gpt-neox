@@ -631,6 +631,20 @@ def forward_step(
         loss = cross_entropy(
             outputs, (labels, loss_mask), _fp16=neox_args.fp16_lm_cross_entropy
         )
+        if neox_args.z_loss > 0:
+            # z-loss (PaLM, arXiv:2204.02311): z_loss * log(Z)^2, averaged over unmasked tokens,
+            # computed like OLMo-core's z_loss_multiplier. lm_loss is CE + z-loss; the parts are
+            # logged under OLMo-core's metric names.
+            assert (
+                neox_args.model_parallel_size == 1
+            ), "LM z-loss assumes each rank holds the full vocab"
+            log_z = torch.logsumexp(outputs.float(), dim=-1).view(-1)
+            mask = loss_mask.view(-1).float()
+            z_loss = torch.sum(log_z**2 * mask) / mask.sum()
+            metrics["CE loss"] = loss.detach()
+            metrics["Z loss"] = neox_args.z_loss * z_loss.detach()
+            metrics["Z loss unscaled"] = z_loss.detach()
+            loss = loss + neox_args.z_loss * z_loss
     elif neox_args.train_impl == "rm":
         maybe_tuple = model((tokens, position_ids, attention_mask), neox_args=neox_args)
         if type(maybe_tuple) is tuple:
@@ -1410,6 +1424,13 @@ def train_step(
             key: reduce_losses(metric_dicts[key]).mean() for key in metric_dicts.keys()
         }
         reduce_metrics["lm_loss"] = reduce_losses(losses).mean()
+        # Total (pre-clipping) grad norm of the last optimizer step; already global across ranks.
+        # Logged as OLMo-core's "optim/total grad norm" (see training_log).
+        grad_norm = model.get_global_grad_norm()
+        if grad_norm is not None:
+            reduce_metrics["optim/total grad norm"] = torch.as_tensor(
+                float(grad_norm), device=torch.cuda.current_device()
+            )
 
     if neox_args.precision == "fp16" and model.optimizer.overflow:
         skipped_iter = 1

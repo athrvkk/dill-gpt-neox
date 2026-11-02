@@ -328,8 +328,10 @@ def training_log(
         comet_experiment=neox_args.comet_experiment,
     )
     for key in loss_dict:
+        # Keys are logged as-is (with spaces, like OLMo-core's "train/CE loss"); keys that already
+        # carry a namespace ("optim/total grad norm") skip the "train/" prefix.
         tb_wandb_log(
-            f'train/{key.replace(" ", "_")}',
+            key if key.startswith("optim/") else f"train/{key}",
             loss_dict[key],
             iteration,
             use_wandb=neox_args.use_wandb,

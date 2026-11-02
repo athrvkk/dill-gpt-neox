@@ -1202,7 +1202,7 @@ class NeoXArgsTraining(NeoXArgsTemplate):
 
     z_loss: float = 0.0
     """
-    Z-loss parameter, only implemented for RM training currently.
+    Z-loss parameter, implemented for RM training and for normal LM training (z_loss * log(Z)^2).
     https://arxiv.org/pdf/2204.02311
     https://arxiv.org/pdf/2309.10305
     """
