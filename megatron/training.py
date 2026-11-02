@@ -64,6 +64,7 @@ from megatron.utils import (
 )
 from megatron.model.weight_server import start_server
 from megatron.model.gpt2_model import cross_entropy
+from megatron.model.transformer import ParallelSelfAttention
 from megatron.mpu import vocab_parallel_cross_entropy
 
 from pickle import dump
@@ -645,6 +646,12 @@ def forward_step(
             metrics["Z loss"] = neox_args.z_loss * z_loss.detach()
             metrics["Z loss unscaled"] = z_loss.detach()
             loss = loss + neox_args.z_loss * z_loss
+        if neox_args.track_output_logit_mean and is_train:
+            # Mean over tokens and (padded) vocab, as OLMo-core's "output logit mean".
+            assert (
+                neox_args.model_parallel_size == 1
+            ), "output logit mean assumes each rank holds the full vocab"
+            metrics["output logit mean"] = outputs.detach().mean(dtype=torch.float32)
     elif neox_args.train_impl == "rm":
         maybe_tuple = model((tokens, position_ids, attention_mask), neox_args=neox_args)
         if type(maybe_tuple) is tuple:
@@ -1329,6 +1336,39 @@ def backward_step(neox_args, timers, optimizer, model, loss):
         raise ValueError("Must be using deepspeed to run neox")
 
 
+def set_attention_stats_tracking(neox_args, model):
+    """
+    Turn attention-stat tracking (track_max_attention_logit / track_attention_entropy) on or off
+    for this iteration, per attention_stats_interval. Returns the attention layers to read with
+    collect_attention_stats(), or [] when nothing is tracked this iteration.
+    """
+    if not (neox_args.track_max_attention_logit or neox_args.track_attention_entropy):
+        return []
+    # neox_args.iteration is the number of completed steps; this step is logged as iteration + 1.
+    track = ((neox_args.iteration or 0) + 1) % neox_args.attention_stats_interval == 0
+    layers = [m for m in model.module.modules() if isinstance(m, ParallelSelfAttention)]
+    for layer in layers:
+        layer.track_stats_now = track
+    return layers if track else []
+
+
+def collect_attention_stats(attention_layers):
+    """
+    Per-layer stats since the last call, as "block NN/max attention logit" (max over
+    micro-batches and data-parallel ranks) and "block NN/attention entropy" (mean), OLMo-core's names.
+    """
+    stats = {}
+    for layer in attention_layers:
+        for name, value in layer.compute_attention_stats().items():
+            value = value.detach().clone()
+            if name == "max attention logit":
+                torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MAX)
+            else:
+                value = reduce_losses([value]).mean()
+            stats[f"block {layer.layer_number:02d}/{name}"] = value
+    return stats
+
+
 def train_step(
     neox_args,
     timers,
@@ -1355,6 +1395,7 @@ def train_step(
     else:
         losses = []
         metric_dicts = defaultdict(list)
+        attention_layers = set_attention_stats_tracking(neox_args, model)
         for _ in range(neox_args.gradient_accumulation_steps):
             # Forward model for one step.
             timers("forward").start()
@@ -1431,6 +1472,7 @@ def train_step(
             reduce_metrics["optim/total grad norm"] = torch.as_tensor(
                 float(grad_norm), device=torch.cuda.current_device()
             )
+        reduce_metrics.update(collect_attention_stats(attention_layers))
 
     if neox_args.precision == "fp16" and model.optimizer.overflow:
         skipped_iter = 1

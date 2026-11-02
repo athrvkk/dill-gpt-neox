@@ -403,6 +403,14 @@ class ParallelSelfAttention(nn.Module):
             self.rotary_emb = None
 
         self.rope_fusion = neox_args.rope_fusion
+        # Attention stats (track_max_attention_logit / track_attention_entropy). train_step sets
+        # track_stats_now on the iterations to track and reads them with compute_attention_stats().
+        self.track_max_logit = neox_args.track_max_attention_logit
+        self.track_attention_entropy = neox_args.track_attention_entropy
+        self.track_stats_now = False
+        self._max_logit = None
+        self._entropy_sum = None
+        self._entropy_count = 0
         self.attention_type = neox_args.attention_config[layer_number]
         self.use_flash_attention = self.attention_type == "flash"
         self.use_triton = (
@@ -569,6 +577,67 @@ class ParallelSelfAttention(nn.Module):
         # change view [b, np, sq, hn]
         context_layer = context_layer.view(*output_size)
         return context_layer
+
+    @torch.no_grad()
+    def _update_attention_stats(self, query_layer, key_layer):
+        """
+        Recompute the scaled pre-softmax attention logits <q, k> * scale over causal positions in
+        fp32 and update the running max logit and/or attention-entropy sum (as in OLMo-core's
+        Attention._update_attention_stats). Document boundaries are ignored, as in training.
+
+        query_layer: [sq, b, np, hn]; key_layer: [sk, b, nkv, hn], after rotary.
+        """
+        # Flash attention uses 1/sqrt(hn) (softmax_scale=None); the other paths use norm_factor.
+        if self.use_flash_attention:
+            scale = self.hidden_size_per_attention_head**-0.5
+        else:
+            scale = 1.0 / self.norm_factor
+        q = query_layer.transpose(0, 1)  # [b, sq, np, hn]
+        k = key_layer.transpose(0, 1)
+        if k.shape[2] != q.shape[2]:
+            k = k.repeat_interleave(q.shape[2] // k.shape[2], dim=2)
+        B, T, H, _ = q.shape
+        causal = torch.ones(T, k.shape[1], dtype=torch.bool, device=q.device).tril()
+        # Chunk over the batch so each fp32 (chunk, H, T, T) tensor stays under ~512MB.
+        chunk = max(1, (1 << 27) // (H * T * k.shape[1]))
+        max_logit = q.new_full((), float("-inf"), dtype=torch.float32)
+        entropy_sum = q.new_zeros((), dtype=torch.float32)
+        for i in range(0, B, chunk):
+            # [chunk, np, sq, sk]
+            logits = torch.einsum(
+                "bqhd,bkhd->bhqk", q[i : i + chunk].float(), k[i : i + chunk].float()
+            )
+            logits.mul_(scale).masked_fill_(~causal, float("-inf"))
+            if self.track_max_logit:
+                max_logit = torch.maximum(max_logit, logits.amax())
+            if self.track_attention_entropy:
+                # entr(p) = -p * log(p), with entr(0) = 0 for the masked positions.
+                entropy_sum += torch.special.entr(logits.softmax(dim=-1)).sum()
+        if self.track_max_logit:
+            self._max_logit = (
+                max_logit
+                if self._max_logit is None
+                else torch.maximum(self._max_logit, max_logit)
+            )
+        if self.track_attention_entropy:
+            self._entropy_sum = (
+                entropy_sum if self._entropy_sum is None else self._entropy_sum + entropy_sum
+            )
+            # One entropy value per (example, head, query position).
+            self._entropy_count += B * H * T
+
+    def compute_attention_stats(self):
+        """
+        Return {"max attention logit": ..., "attention entropy": ...} (tracked ones only) since the
+        last call, and reset.
+        """
+        stats = {}
+        if self._max_logit is not None:
+            stats["max attention logit"] = self._max_logit
+        if self._entropy_sum is not None:
+            stats["attention entropy"] = self._entropy_sum / self._entropy_count
+        self._max_logit, self._entropy_sum, self._entropy_count = None, None, 0
+        return stats
 
     def flash_attention(self, query_layer, key_layer, value_layer):
         # [b, np, sq, sk]
@@ -872,6 +941,9 @@ class ParallelSelfAttention(nn.Module):
 
         if self.use_cache:
             present = torch.stack((key_layer, value_layer))
+
+        if self.track_stats_now and self.training:
+            self._update_attention_stats(query_layer, key_layer)
 
         if self.use_flash_attention:
             context_layer = self.flash_attention(query_layer, key_layer, value_layer)

@@ -794,6 +794,33 @@ class NeoXArgsLogging(NeoXArgsTemplate):
     Log the frob norm of the optimizer states to wandb / tensorboard (useful for debugging).
     """
 
+    track_max_attention_logit: bool = False
+    """
+    Log the max pre-softmax attention logit <q, k> * scale over causal positions per layer during
+    training (Wortsman et al. 2024, Fig. G.1), as "block NN/max attention logit". The logits are
+    recomputed in fp32 from q and k (after rotary), so this also works with flash attention.
+    Assumes model_parallel_size == 1 and no activation checkpointing (which would count twice).
+    """
+
+    track_attention_entropy: bool = False
+    """
+    Log the attention entropy -sum_j A_ij log A_ij per layer, averaged over examples, heads and
+    query positions (Zhai et al. 2023, Sec. 3.1), as "block NN/attention entropy". Computed with
+    track_max_attention_logit's recomputed logits; same assumptions.
+    """
+
+    attention_stats_interval: int = 1
+    """
+    Compute track_max_attention_logit / track_attention_entropy every this many iterations (they
+    recompute the full attention matrix, so they add noticeable time per step).
+    """
+
+    track_output_logit_mean: bool = False
+    """
+    Log the mean output logit over tokens and (padded) vocab during training (Wortsman et al.
+    2024, Fig. G.2), as "output logit mean". Assumes model_parallel_size == 1.
+    """
+
     log_gradient_noise_scale: bool = False
     """
     Whether to log the gradient noise scale when training (cf. https://arxiv.org/abs/1812.06162 for explanation)
