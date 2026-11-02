@@ -474,9 +474,8 @@ class NeoXArgs(*BASE_CLASSES):
                 if neox_args.wandb_group is None:
                     # Set a randomized string as group name if no group name is provided
                     neox_args.wandb_group = wandb.sdk.lib.runid.generate_id()
-                else:
-                    # Concatenate the W&B group name with a randomized string to ensure uniqueness.
-                    neox_args.wandb_group += "_" + wandb.sdk.lib.runid.generate_id()
+                # A configured group is kept as-is (upstream appended a random suffix), so runs from
+                # separate launches share a group, as with the OLMo-core runs.
             except ModuleNotFoundError as e:
                 if e.name == "wandb":
                     e.msg += "\nWeights & Biases monitoring was requested but `wandb` was not found. Install `wandb` to use Weights & Biases, or set the `use_wandb` configuration option to a boolean false to disable Weights & Biases logging."
