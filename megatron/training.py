@@ -64,11 +64,17 @@ from megatron.utils import (
 )
 from megatron.model.weight_server import start_server
 from megatron.model.gpt2_model import cross_entropy
-from megatron.model.transformer import ParallelSelfAttention
+from megatron.model.transformer import (
+    ParallelLinear,
+    ParallelSelfAttention,
+    ParallelTransformerLayer,
+)
+from megatron.model.word_embeddings import Embedding
 from megatron.mpu import vocab_parallel_cross_entropy
 
 from pickle import dump
 import os
+import time
 
 
 def mup_weights_reinit(neox_args, model):
@@ -1336,20 +1342,29 @@ def backward_step(neox_args, timers, optimizer, model, loss):
         raise ValueError("Must be using deepspeed to run neox")
 
 
-def set_attention_stats_tracking(neox_args, model):
+def attention_layers_to_track(neox_args, model):
     """
-    Turn attention-stat tracking (track_max_attention_logit / track_attention_entropy) on or off
-    for this iteration, per attention_stats_interval. Returns the attention layers to read with
-    collect_attention_stats(), or [] when nothing is tracked this iteration.
+    The attention layers whose stats (track_max_attention_logit / track_attention_entropy) to
+    track this iteration, per attention_stats_interval, or [] when nothing is tracked. train_step
+    turns tracking on for these with set_attention_stats_tracking() during forward passes only, and
+    reads the stats with collect_attention_stats().
     """
     if not (neox_args.track_max_attention_logit or neox_args.track_attention_entropy):
         return []
     # neox_args.iteration is the number of completed steps; this step is logged as iteration + 1.
-    track = ((neox_args.iteration or 0) + 1) % neox_args.attention_stats_interval == 0
-    layers = [m for m in model.module.modules() if isinstance(m, ParallelSelfAttention)]
-    for layer in layers:
-        layer.track_stats_now = track
-    return layers if track else []
+    if ((neox_args.iteration or 0) + 1) % neox_args.attention_stats_interval != 0:
+        return []
+    return [m for m in model.module.modules() if isinstance(m, ParallelSelfAttention)]
+
+
+def set_attention_stats_tracking(attention_layers, on):
+    """
+    Turn attention-stat tracking on or off. Activation checkpointing re-runs each checkpointed
+    layer's forward inside backward_step, so tracking is on only during forward_step: each layer
+    is then counted once per micro-batch, with or without checkpointing (reentrant or not).
+    """
+    for layer in attention_layers:
+        layer.track_stats_now = on
 
 
 def collect_attention_stats(attention_layers):
@@ -1367,6 +1382,84 @@ def collect_attention_stats(attention_layers):
                 value = reduce_losses([value]).mean()
             stats[f"block {layer.layer_number:02d}/{name}"] = value
     return stats
+
+
+def geometric_metric_matrices(model):
+    """
+    [(label, param)] for every weight matrix (2-D parameter) of the model, labelled
+    "block NN/<matrix>" (as the attention stats), "embedding/<matrix>" or "unembedding/<matrix>",
+    e.g. "block 00/attention.query_key_value". Tied weights appear once.
+    """
+    labels = {}
+    # modules() lists a module before its children, so the outermost labelled module wins.
+    for module in model.module.modules():
+        if isinstance(module, ParallelTransformerLayer):
+            prefix = f"block {module.layer_number:02d}"
+        elif isinstance(module, Embedding):
+            prefix = "embedding"
+        elif isinstance(module, ParallelLinear):
+            prefix = "unembedding"
+        else:
+            continue
+        for name, param in module.named_parameters():
+            if param.ndim == 2 and id(param) not in labels:
+                labels[id(param)] = f"{prefix}/{name.removesuffix('.weight')}"
+    return [
+        (labels.get(id(param), name.removesuffix(".weight")), param)
+        for name, param in model.module.named_parameters()
+        if param.ndim == 2
+    ]
+
+
+def log_geometric_metrics(neox_args, model, iteration):
+    """
+    Log saturation's geometric metrics (src/metrics/geometric_metrics.py) of every weight matrix,
+    as "geometry/<label>/<metric>" (see geometric_metric_matrices). Must be called on all ranks:
+    assembling the fp32 master weights all-reduces over the data-parallel group. The metrics are
+    computed on the CPU on rank 0 only; a matrix whose metrics fail is reported and skipped, so
+    a metric bug can't kill the run.
+    """
+    import geometric_metrics
+    from threadpoolctl import threadpool_limits
+
+    start = time.time()
+    is_rank_0 = torch.distributed.get_rank() == 0
+    # One numpy/sklearn BLAS thread: with both it and torch's pool on the job's few CPUs, each small
+    # torch op waits on spinning BLAS threads (~6x slower on the block matrices, ~2x per pass).
+    with torch.no_grad(), threadpool_limits(1, user_api="blas"):
+        for label, param in geometric_metric_matrices(model):
+            # fp32 master weight from the optimizer (the module holds the bf16/fp16 copy), if any.
+            weight = deepspeed.utils.safe_get_full_fp32_param(param)
+            if weight is None:
+                weight = param
+            if not is_rank_0:
+                continue
+            try:
+                # Without the PCA eigenspectrum (rankme, alpha, fit_r2*) and isotropy(_centered),
+                # ~80% of the time on the 50k-row embedding/unembedding.
+                metrics = geometric_metrics.compute_mtrx_geometric_metrics(
+                    weight.detach().float().cpu(),
+                    eigenspectrum_metrics=False,
+                    isotropy_metrics=False,
+                )
+            except Exception as e:
+                print(
+                    f"geometric metrics failed for {label} at iteration {iteration}: {e!r}",
+                    flush=True,
+                )
+                continue
+            for name, value in metrics.items():
+                tb_wandb_log(
+                    f"geometry/{label}/{name}",
+                    value,
+                    iteration,
+                    use_wandb=neox_args.use_wandb,
+                    tensorboard_writer=neox_args.tensorboard_writer,
+                    comet_experiment=neox_args.comet_experiment,
+                )
+    print_rank_0(
+        f"geometric metrics at iteration {iteration} took {time.time() - start:.1f}s"
+    )
 
 
 def train_step(
@@ -1395,10 +1488,11 @@ def train_step(
     else:
         losses = []
         metric_dicts = defaultdict(list)
-        attention_layers = set_attention_stats_tracking(neox_args, model)
+        attention_layers = attention_layers_to_track(neox_args, model)
         for _ in range(neox_args.gradient_accumulation_steps):
             # Forward model for one step.
             timers("forward").start()
+            set_attention_stats_tracking(attention_layers, True)
             loss, metric_dict = forward_step(
                 neox_args=neox_args,
                 timers=timers,
@@ -1407,6 +1501,8 @@ def train_step(
                 is_train=True,
                 reference_model=reference_model,
             )
+            # Not during backward_step, which re-runs checkpointed layers' forward.
+            set_attention_stats_tracking(attention_layers, False)
             timers("forward").stop()
             losses.append(loss)
             for key in metric_dict.keys():
@@ -1556,6 +1652,23 @@ def train(
     # to monitor if we've skipped many iterations in a row and trigger an early exit
     overflow_monitor = OverflowMonitor(optimizer)
 
+    if neox_args.geometric_metrics_interval:
+        # Fail now rather than at the first logging interval.
+        assert (
+            mpu.get_model_parallel_world_size() == 1
+        ), "geometric_metrics_interval assumes model_parallel_size == 1"
+        try:
+            import geometric_metrics
+        except ImportError as e:
+            raise ImportError(
+                "geometric_metrics_interval needs saturation's src/metrics on PYTHONPATH "
+                "(and its dependencies, e.g. IsoScore, installed)"
+            ) from e
+        if iteration == 0:  # the metrics at initialization
+            timers("interval time").stop()
+            log_geometric_metrics(neox_args, model, iteration)
+            timers("interval time").start()
+
     if neox_args.profile:
         schedule = torch.profiler.schedule(
             wait=neox_args.profile_step_start,
@@ -1620,6 +1733,15 @@ def train(
             optimizer=optimizer,
             noise_scale_logger=noise_scale_logger,
         )
+
+        if (
+            neox_args.geometric_metrics_interval
+            and iteration % neox_args.geometric_metrics_interval == 0
+        ):
+            # Keep the metrics' time out of the logged "elapsed time per iteration".
+            timers("interval time").stop()
+            log_geometric_metrics(neox_args, model, iteration)
+            timers("interval time").start()
 
         # Checkpointing
         if neox_args.save and is_save_iter(neox_args, iteration):

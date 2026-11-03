@@ -799,7 +799,8 @@ class NeoXArgsLogging(NeoXArgsTemplate):
     Log the max pre-softmax attention logit <q, k> * scale over causal positions per layer during
     training (Wortsman et al. 2024, Fig. G.1), as "block NN/max attention logit". The logits are
     recomputed in fp32 from q and k (after rotary), so this also works with flash attention.
-    Assumes model_parallel_size == 1 and no activation checkpointing (which would count twice).
+    Assumes model_parallel_size == 1. Works with activation checkpointing: only the forward pass is
+    tracked, not the recomputation in backward.
     """
 
     track_attention_entropy: bool = False
@@ -813,6 +814,16 @@ class NeoXArgsLogging(NeoXArgsTemplate):
     """
     Compute track_max_attention_logit / track_attention_entropy every this many iterations (they
     recompute the full attention matrix, so they add noticeable time per step).
+    """
+
+    geometric_metrics_interval: int = 0
+    """
+    Every this many iterations (0 = off), log the geometric metrics of every weight matrix (ranks,
+    norms, singular-value stats, t_sim, t_cos, iso_score; not the slow PCA-eigenspectrum
+    rankme/alpha/fit_r2* or isotropy/isotropy_centered) from saturation's
+    src/metrics/geometric_metrics.py, as "geometry/<block NN|embedding|unembedding>/<matrix>/<metric>".
+    geometric_metrics.py must be importable (scripts/neox_train.sh puts src/metrics on PYTHONPATH).
+    Computed on the CPU from the fp32 master weights, on rank 0. Assumes model_parallel_size == 1.
     """
 
     track_output_logit_mean: bool = False
