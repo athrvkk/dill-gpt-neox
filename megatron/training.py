@@ -632,17 +632,17 @@ def forward_step(
         loss = cross_entropy(
             outputs, (labels, loss_mask), _fp16=neox_args.fp16_lm_cross_entropy
         )
+        # Logged under OLMo-core's metric names; lm_loss is CE (+ z-loss when z_loss > 0).
+        metrics["CE loss"] = loss.detach()
         if neox_args.z_loss > 0:
             # z-loss (PaLM, arXiv:2204.02311): z_loss * log(Z)^2, averaged over unmasked tokens,
-            # computed like OLMo-core's z_loss_multiplier. lm_loss is CE + z-loss; the parts are
-            # logged under OLMo-core's metric names.
+            # computed like OLMo-core's z_loss_multiplier.
             assert (
                 neox_args.model_parallel_size == 1
             ), "LM z-loss assumes each rank holds the full vocab"
             log_z = torch.logsumexp(outputs.float(), dim=-1).view(-1)
             mask = loss_mask.view(-1).float()
             z_loss = torch.sum(log_z**2 * mask) / mask.sum()
-            metrics["CE loss"] = loss.detach()
             metrics["Z loss"] = neox_args.z_loss * z_loss.detach()
             metrics["Z loss unscaled"] = z_loss.detach()
             loss = loss + neox_args.z_loss * z_loss
