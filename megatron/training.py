@@ -1488,6 +1488,7 @@ def train_step(
     else:
         losses = []
         metric_dicts = defaultdict(list)
+        nonfinite_skip = False
         attention_layers = attention_layers_to_track(neox_args, model)
         for _ in range(neox_args.gradient_accumulation_steps):
             # Forward model for one step.
@@ -1539,7 +1540,31 @@ def train_step(
 
             timers("optimizer").start()
             if neox_args.deepspeed:
-                model.step()
+                try:
+                    model.step()
+                except AssertionError:
+                    # DeepSpeed's bf16 optimizer asserts `grad_norm > 0` before touching
+                    # any weights, so a NaN/inf/zero global grad norm lands here. Drop the
+                    # update instead of crashing so diverging configs can run to completion.
+                    gnorm = getattr(model.optimizer, "_global_grad_norm", None)
+                    gnorm = float(gnorm) if gnorm is not None else None
+                    if gnorm is None or (math.isfinite(gnorm) and gnorm > 0):
+                        raise  # some other assertion -- don't swallow it
+                    print_rank_0(
+                        f"WARNING: skipping optimizer step at iteration "
+                        f"{neox_args.iteration}: global grad norm = {gnorm}"
+                    )
+                    # Finish the bookkeeping that engine.step() never reached.
+                    model.optimizer.clear_hp_grads()
+                    model.optimizer.clear_lp_grads()
+                    model._stop_timers(model.engine_timers.step_timers)
+                    model.skipped_steps += 1
+                    model.global_steps += 1
+                    model.global_samples += model.train_batch_size()
+                    # Keep the LR schedule aligned with the iteration count.
+                    if model.lr_scheduler is not None:
+                        model.lr_scheduler.step()
+                    nonfinite_skip = True
             else:
                 raise ValueError("Must be using deepspeed to run neox")
             timers("optimizer").stop()
@@ -1571,6 +1596,8 @@ def train_step(
         reduce_metrics.update(collect_attention_stats(attention_layers))
 
     if neox_args.precision == "fp16" and model.optimizer.overflow:
+        skipped_iter = 1
+    elif not neox_args.is_pipe_parallel and nonfinite_skip:
         skipped_iter = 1
     else:
         skipped_iter = 0
