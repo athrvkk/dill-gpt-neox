@@ -41,6 +41,7 @@ from megatron.utils import (
 )
 
 from megatron import print_rank_0, mpu
+from megatron import activation_geometry
 from megatron.model import (
     GPT2ModelPipe,
     SoftEmbedding,
@@ -1462,6 +1463,80 @@ def log_geometric_metrics(neox_args, model, iteration):
     )
 
 
+# The ActivationCapture of the current train() call (activation_geometry_interval /
+# activation_probe_interval), or None.
+_activation_capture = None
+
+
+def activation_seed(neox_args, step):
+    """Seed of the token positions sampled at a step (the probe uses step 0: the same every time)."""
+    return neox_args.seed * 10_000_000 + step
+
+
+def activation_capture_due(neox_args):
+    """The ActivationCapture to fill during this iteration's first forward pass, or None."""
+    interval = neox_args.activation_geometry_interval
+    # neox_args.iteration is the number of completed steps; this step is logged as iteration + 1.
+    if _activation_capture is None or not interval or ((neox_args.iteration or 0) + 1) % interval:
+        return None
+    return _activation_capture
+
+
+def log_activation_geometry(neox_args, capture, iteration, prefix):
+    """Log the metrics of the capture's last forward pass as "<prefix>/<label>/<metric>"."""
+    start = time.time()
+    if os.environ.get("NEOX_ACTIVATION_GEOMETRY_SELFCHECK"):
+        errors = {k: round(v, 5) for k, v in capture.residual_check().items()}
+        print_rank_0(f"{prefix} residual check at iteration {iteration} (max relative errors): {errors}")
+    metrics = capture.compute()
+    if os.environ.get("NEOX_ACTIVATION_GEOMETRY_SELFCHECK"):
+        print_rank_0(
+            f"{prefix} metrics at iteration {iteration} took {time.time() - start:.3f}s, e.g. "
+            + ", ".join(f"{k}={metrics[k]:.4g}" for k in list(metrics)[:3] + list(metrics)[-3:])
+        )
+    for key, value in metrics.items():
+        tb_wandb_log(
+            f"{prefix}/{key}",
+            value,
+            iteration,
+            use_wandb=neox_args.use_wandb,
+            tensorboard_writer=neox_args.tensorboard_writer,
+            comet_experiment=neox_args.comet_experiment,
+        )
+
+
+def take_probe_batch(valid_data_iterator):
+    """The first validation micro-batch (activation_probe_interval), consumed from the iterator."""
+    if isinstance(valid_data_iterator, dict):  # named validation sets: the first one
+        valid_data_iterator = next(iter(valid_data_iterator.values()), None)
+    if valid_data_iterator is None:
+        raise ValueError("activation_probe_interval needs validation data (valid-data-paths)")
+    return next(valid_data_iterator)
+
+
+def log_activation_probe(neox_args, model, capture, probe_batch, iteration):
+    """Run the probe batch (no gradients, eval mode) and log its activation geometry and loss."""
+    model.eval()
+    capture.start(seed=activation_seed(neox_args, 0))
+    with torch.no_grad():
+        _, metrics = forward_step(
+            data_iterator=iter([probe_batch]), model=model, neox_args=neox_args, timers=None
+        )
+    capture.stop()
+    if neox_args.deepspeed and neox_args.deepspeed_activation_checkpointing:
+        deepspeed.checkpointing.reset()  # as evaluate() does after forward-only passes
+    model.train()
+    tb_wandb_log(
+        "activation_probe/CE loss",
+        reduce_losses([metrics["CE loss"]]).mean().item(),
+        iteration,
+        use_wandb=neox_args.use_wandb,
+        tensorboard_writer=neox_args.tensorboard_writer,
+        comet_experiment=neox_args.comet_experiment,
+    )
+    log_activation_geometry(neox_args, capture, iteration, "activation_probe")
+
+
 def train_step(
     neox_args,
     timers,
@@ -1490,10 +1565,13 @@ def train_step(
         metric_dicts = defaultdict(list)
         nonfinite_skip = False
         attention_layers = attention_layers_to_track(neox_args, model)
-        for _ in range(neox_args.gradient_accumulation_steps):
+        activation_capture = activation_capture_due(neox_args)
+        for micro_batch in range(neox_args.gradient_accumulation_steps):
             # Forward model for one step.
             timers("forward").start()
             set_attention_stats_tracking(attention_layers, True)
+            if activation_capture is not None and micro_batch == 0:
+                activation_capture.start(seed=activation_seed(neox_args, (neox_args.iteration or 0) + 1))
             loss, metric_dict = forward_step(
                 neox_args=neox_args,
                 timers=timers,
@@ -1504,6 +1582,8 @@ def train_step(
             )
             # Not during backward_step, which re-runs checkpointed layers' forward.
             set_attention_stats_tracking(attention_layers, False)
+            if activation_capture is not None:
+                activation_capture.stop()
             timers("forward").stop()
             losses.append(loss)
             for key in metric_dict.keys():
@@ -1696,6 +1776,18 @@ def train(
             log_geometric_metrics(neox_args, model, iteration)
             timers("interval time").start()
 
+    global _activation_capture
+    _activation_capture = None
+    probe_batch = None
+    if neox_args.activation_geometry_interval or neox_args.activation_probe_interval:
+        _activation_capture = activation_geometry.ActivationCapture(model, neox_args)
+        if neox_args.activation_probe_interval:
+            probe_batch = take_probe_batch(valid_data_iterator)
+            if iteration == 0:  # the probe at initialization
+                timers("interval time").stop()
+                log_activation_probe(neox_args, model, _activation_capture, probe_batch, iteration)
+                timers("interval time").start()
+
     if neox_args.profile:
         schedule = torch.profiler.schedule(
             wait=neox_args.profile_step_start,
@@ -1768,6 +1860,23 @@ def train(
             # Keep the metrics' time out of the logged "elapsed time per iteration".
             timers("interval time").stop()
             log_geometric_metrics(neox_args, model, iteration)
+            timers("interval time").start()
+
+        if (
+            neox_args.activation_geometry_interval
+            and iteration % neox_args.activation_geometry_interval == 0
+        ):
+            # Filled by train_step during this iteration's first forward pass (activation_capture_due).
+            timers("interval time").stop()
+            log_activation_geometry(neox_args, _activation_capture, iteration, "activation")
+            timers("interval time").start()
+
+        if (
+            neox_args.activation_probe_interval
+            and iteration % neox_args.activation_probe_interval == 0
+        ):
+            timers("interval time").stop()
+            log_activation_probe(neox_args, model, _activation_capture, probe_batch, iteration)
             timers("interval time").start()
 
         # Checkpointing

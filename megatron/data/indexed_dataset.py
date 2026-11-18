@@ -13,6 +13,7 @@
 # Added document index to index file and made it accessible.
 #    An empty sentence no longer separates documents.
 
+import mmap
 import os
 import shutil
 import struct
@@ -331,6 +332,10 @@ class IndexedDatasetBuilder(object):
         index.close()
 
 
+# Reads (get / __getitem__) between unmappings of the .bin file, per process: see MMapIndexedDataset._count_read.
+UNMAP_DATA_EVERY_READS = 10_000
+
+
 def _warmup_mmap_file(path):
     with open(path, "rb") as stream:
         while stream.read(100 * 1024 * 1024):
@@ -486,6 +491,23 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
         )
         print_rank_0("    creating memory view of numpy buffer...")
         self._bin_buffer = memoryview(self._bin_buffer_mmap)
+        # Reads are random: don't read ahead around each page fault.
+        self._bin_buffer_mmap._mmap.madvise(mmap.MADV_RANDOM)
+        self._reads_since_unmap = 0
+
+    def _count_read(self):
+        """
+        Every UNMAP_DATA_EVERY_READS reads, unmap the .bin file's pages from this process. Pages of a
+        file mapping stay mapped once read, and the job's cgroup counts mapped pages as its memory but
+        doesn't reclaim them, so reading a large dataset is a memory leak: OOM-killed at 384GB (312GB
+        mapped) after 40k iterations on 8 GPUs of the 664GB Pile. MADV_DONTNEED on this read-only file
+        mapping only unmaps: the data stays in the page cache, now reclaimable, and arrays already
+        returned stay valid (their pages fault back in from the cache if touched).
+        """
+        self._reads_since_unmap += 1
+        if self._reads_since_unmap >= UNMAP_DATA_EVERY_READS:
+            self._reads_since_unmap = 0
+            self._bin_buffer_mmap._mmap.madvise(mmap.MADV_DONTNEED)
 
     def __del__(self):
         self._bin_buffer_mmap._mmap.close()
@@ -497,6 +519,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
     # @lru_cache(maxsize=8)
     def __getitem__(self, idx):
+        self._count_read()
         if isinstance(idx, int):
             ptr, size = self._index[idx]
             np_array = np.frombuffer(
@@ -523,6 +546,7 @@ class MMapIndexedDataset(torch.utils.data.Dataset):
 
         get(idx) is the same as [idx] but get() does not support slicing.
         """
+        self._count_read()
         ptr, size = self._index[idx]
         if length is None:
             length = size - offset

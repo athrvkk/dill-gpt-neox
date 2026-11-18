@@ -826,6 +826,36 @@ class NeoXArgsLogging(NeoXArgsTemplate):
     Computed on the CPU from the fp32 master weights, on rank 0. Assumes model_parallel_size == 1.
     """
 
+    activation_geometry_interval: int = 0
+    """
+    Every this many iterations (0 = off), log the geometry of the activations of that iteration's first
+    training micro-batch (megatron/activation_geometry.py): for the embedding output, every block's
+    residual stream, attention branch output and MLP branch output, and the final norm's output, the
+    metrics of geometric_metrics.py (ranks, rankme, alpha, norms, singular-value stats, t_sim, t_cos,
+    iso_score) plus mean_token_norm, as "activation/<label>/<metric>"; and per block the attention-MLP
+    branch redundancy, as "activation/block NN/branch/<cos|norm_ratio|subspace_overlap>". Computed on the
+    GPU from activation_geometry_tokens sampled token positions (the same positions at every capture
+    point), averaged over data-parallel ranks. Assumes model_parallel_size == 1, no pipeline or sequence
+    parallelism, no MoE and no TransformerEngine layers.
+    """
+
+    activation_probe_interval: int = 0
+    """
+    Every this many iterations (0 = off), and at iteration 0, the same activation geometry on a fixed
+    probe batch, as "activation_probe/<label>/<metric>", plus the probe batch's loss as
+    "activation_probe/CE loss". The probe batch is the first validation micro-batch (taken from the
+    validation iterator when training starts, so evaluation starts one micro-batch later), with fixed
+    token positions; it runs without gradients, in eval mode. Unlike activation_geometry_interval, this
+    separates changes of the model from changes of the training batch. Needs validation data.
+    """
+
+    activation_geometry_tokens: int = 4096
+    """
+    Token positions sampled per capture for activation_geometry_interval / activation_probe_interval
+    (at most the micro-batch's sequences x sequence length). The matrix norms and other sum-type metrics
+    grow with it, so keep it fixed within a comparison.
+    """
+
     track_output_logit_mean: bool = False
     """
     Log the mean output logit over tokens and (padded) vocab during training (Wortsman et al.
