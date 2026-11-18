@@ -16,7 +16,7 @@ import math
 import torch
 import numpy as np
 from typing import List, Tuple
-from itertools import zip_longest, cycle
+from itertools import zip_longest
 from functools import partial
 
 from megatron import mpu, print_rank_0
@@ -868,10 +868,11 @@ def shift_and_wrap_data_loaders(neox_args, data_loaders, loop=True):
                 yield x
             data_loader.start_iter = 0
 
-    # Build iterators.
+    # Build iterators. Not itertools.cycle: it keeps every item it yields (to replay them), i.e. every batch, in pinned
+    # host memory with pin_memory=True: 1 MB per iteration per rank, OOM-killing long runs.
     if train_dataloader is not None:
         if loop:
-            train_data_iterator = cycle(train_dataloader)
+            train_data_iterator = loop_iterator(train_dataloader)
         else:
             train_data_iterator = iter(train_dataloader)
     else:
@@ -879,7 +880,7 @@ def shift_and_wrap_data_loaders(neox_args, data_loaders, loop=True):
 
     if valid_dataloader is not None:
         if loop:
-            valid_data_iterator = cycle(valid_dataloader)
+            valid_data_iterator = loop_iterator(valid_dataloader)
         else:
             valid_data_iterator = iter(valid_dataloader)
     else:
@@ -887,7 +888,7 @@ def shift_and_wrap_data_loaders(neox_args, data_loaders, loop=True):
 
     if test_dataloader is not None:
         if loop:
-            test_data_iterator = cycle(test_dataloader)
+            test_data_iterator = loop_iterator(test_dataloader)
         else:
             test_data_iterator = iter(test_dataloader)
     else:
