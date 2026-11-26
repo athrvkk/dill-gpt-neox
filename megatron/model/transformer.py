@@ -407,10 +407,14 @@ class ParallelSelfAttention(nn.Module):
         # track_stats_now on the iterations to track and reads them with compute_attention_stats().
         self.track_max_logit = neox_args.track_max_attention_logit
         self.track_attention_entropy = neox_args.track_attention_entropy
+        self.track_qk_norms = neox_args.track_qk_norms
+        self.track_logits_per_head = neox_args.track_attention_logits_per_head
+        self._head_logits = None  # (max per head, sum of causal logits per head, count per head)
         self.track_stats_now = False
         self._max_logit = None
         self._entropy_sum = None
         self._entropy_count = 0
+        self._qk_norms = None  # [max |q|, max |k|, sum |q|, sum |k|, count q, count k]
         self.attention_type = neox_args.attention_config[layer_number]
         self.use_flash_attention = self.attention_type == "flash"
         self.use_triton = (
@@ -583,10 +587,27 @@ class ParallelSelfAttention(nn.Module):
         """
         Recompute the scaled pre-softmax attention logits <q, k> * scale over causal positions in
         fp32 and update the running max logit and/or attention-entropy sum (as in OLMo-core's
-        Attention._update_attention_stats). Document boundaries are ignored, as in training.
+        Attention._update_attention_stats), and/or the running query/key norm stats. Document
+        boundaries are ignored, as in training.
 
         query_layer: [sq, b, np, hn]; key_layer: [sk, b, nkv, hn], after rotary.
         """
+        if self.track_qk_norms:
+            qn = torch.linalg.vector_norm(query_layer.float(), dim=-1)
+            kn = torch.linalg.vector_norm(key_layer.float(), dim=-1)
+            stats = torch.stack(
+                [qn.max(), kn.max(), qn.sum(), kn.sum()]
+                + [torch.tensor(float(t.numel()), device=qn.device) for t in (qn, kn)]
+            )
+            if self._qk_norms is None:
+                self._qk_norms = stats
+            else:
+                self._qk_norms = torch.cat(
+                    [torch.maximum(self._qk_norms[:2], stats[:2]), self._qk_norms[2:] + stats[2:]]
+                )
+        per_head = self.track_logits_per_head
+        if not (self.track_max_logit or self.track_attention_entropy or per_head):
+            return
         # Flash attention uses 1/sqrt(hn) (softmax_scale=None); the other paths use norm_factor.
         if self.use_flash_attention:
             scale = self.hidden_size_per_attention_head**-0.5
@@ -601,6 +622,7 @@ class ParallelSelfAttention(nn.Module):
         # Chunk over the batch so each fp32 (chunk, H, T, T) tensor stays under ~512MB.
         chunk = max(1, (1 << 27) // (H * T * k.shape[1]))
         max_logit = q.new_full((), float("-inf"), dtype=torch.float32)
+        head_max = q.new_full((H,), float("-inf"), dtype=torch.float32)
         entropy_sum = q.new_zeros((), dtype=torch.float32)
         for i in range(0, B, chunk):
             # [chunk, np, sq, sk]
@@ -608,12 +630,28 @@ class ParallelSelfAttention(nn.Module):
                 "bqhd,bkhd->bhqk", q[i : i + chunk].float(), k[i : i + chunk].float()
             )
             logits.mul_(scale).masked_fill_(~causal, float("-inf"))
-            if self.track_max_logit:
+            if per_head:
+                head_max = torch.maximum(head_max, logits.amax(dim=(0, 2, 3)))
+            elif self.track_max_logit:
                 max_logit = torch.maximum(max_logit, logits.amax())
             if self.track_attention_entropy:
                 # entr(p) = -p * log(p), with entr(0) = 0 for the masked positions.
                 entropy_sum += torch.special.entr(logits.softmax(dim=-1)).sum()
-        if self.track_max_logit:
+        if per_head:
+            max_logit = head_max.max()
+            # Sum of <q_i, k_j> * scale over causal pairs j <= i, per head, without the T x T matrix:
+            # sum_i <q_i, sum_{j<=i} k_j> (sq == sk while training).
+            head_sum = (q.float() * k.float().cumsum(dim=1)).sum(dim=(0, 1, 3)) * scale
+            self._head_logits = (
+                (head_max, head_sum, B * T * (T + 1) / 2)
+                if self._head_logits is None
+                else (
+                    torch.maximum(self._head_logits[0], head_max),
+                    self._head_logits[1] + head_sum,
+                    self._head_logits[2] + B * T * (T + 1) / 2,
+                )
+            )
+        if self.track_max_logit or per_head:
             self._max_logit = (
                 max_logit
                 if self._max_logit is None
@@ -628,15 +666,29 @@ class ParallelSelfAttention(nn.Module):
 
     def compute_attention_stats(self):
         """
-        Return {"max attention logit": ..., "attention entropy": ...} (tracked ones only) since the
-        last call, and reset.
+        Return {"max attention logit", "attention entropy", "query norm", "key norm", "max query
+        norm", "max key norm", "mean attention logit", "head H/max attention logit", "head H/mean
+        attention logit"} (tracked ones only) since the last call, and reset. Names whose last part
+        starts with "max " are maxima; the others are means.
         """
         stats = {}
         if self._max_logit is not None:
             stats["max attention logit"] = self._max_logit
+        if self._head_logits is not None:
+            head_max, head_sum, count = self._head_logits
+            stats["mean attention logit"] = head_sum.sum() / (count * len(head_sum))
+            for h in range(len(head_max)):
+                stats[f"head {h}/max attention logit"] = head_max[h]
+                stats[f"head {h}/mean attention logit"] = head_sum[h] / count
+            self._head_logits = None
         if self._entropy_sum is not None:
             stats["attention entropy"] = self._entropy_sum / self._entropy_count
+        if self._qk_norms is not None:
+            q_max, k_max, q_sum, k_sum, q_count, k_count = self._qk_norms
+            stats.update({"max query norm": q_max, "max key norm": k_max,
+                          "query norm": q_sum / q_count, "key norm": k_sum / k_count})
         self._max_logit, self._entropy_sum, self._entropy_count = None, None, 0
+        self._qk_norms = None
         return stats
 
     def flash_attention(self, query_layer, key_layer, value_layer):

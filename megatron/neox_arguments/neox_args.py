@@ -810,10 +810,59 @@ class NeoXArgsLogging(NeoXArgsTemplate):
     track_max_attention_logit's recomputed logits; same assumptions.
     """
 
+    track_qk_norms: bool = False
+    """
+    Log the L2 norms of the query and key vectors per layer (after rotary, which preserves norms;
+    before the 1/sqrt(head dim) scale), as "block NN/query norm" and "block NN/key norm" (mean over
+    tokens and heads) and "block NN/max query norm" / "block NN/max key norm" (max over tokens,
+    heads, micro-batches and data-parallel ranks). The max attention logit is bounded by
+    max |q| * max |k| * scale, so these show which side grows (what QK-layernorm controls). Cheap:
+    no attention matrix. Same assumptions as track_max_attention_logit.
+    """
+
+    track_attention_logits_per_head: bool = False
+    """
+    Also log, per head, the max and the mean pre-softmax attention logit over causal positions, as
+    "block NN/head H/max attention logit" and "block NN/head H/mean attention logit", and the
+    layer's "block NN/mean attention logit" (and "block NN/max attention logit" = max over heads).
+    Recomputes the attention matrix like track_max_attention_logit; same assumptions.
+    """
+
+    branch_grad_interval: int = 0
+    """
+    Every this many iterations (0 = off), on the first training micro-batch, log per block the
+    cosine between the gradients the attention and the MLP branch send back into the residual stream
+    (through their LayerNorms), "branch/block NN/grad cos" (mean over tokens), and their norm ratio
+    "branch/block NN/grad norm ratio" (mean attention / mean MLP gradient norm)
+    (megatron/branch_metrics.py). Assumes model_parallel_size == 1, no pipeline parallelism and no
+    activation checkpointing.
+    """
+
+    branch_probe_interval: int = 0
+    """
+    Every this many iterations (0 = off), and at iteration 0, on the fixed probe batch (the first
+    validation micro-batch, as activation_probe_interval; eval mode), log per block
+    (megatron/branch_metrics.py):
+    - "branch/block NN/{attention, mlp} loss increase": the probe CE loss with that branch's output
+      (incl. bias) set to zero minus the probe CE loss ("branch/probe CE loss"): each branch's
+      marginal contribution to the loss;
+    - "branch/block NN/jacobian {write, read} overlap": for branch_probe_sequences tokens (one per
+      sequence, so attention couples none of them), the per-token Jacobians of each branch's output
+      w.r.t. its residual-stream input (d x d, by d vector-Jacobian products), and the overlap
+      ||Ua^T Um||_F^2 / k of the top-k left ("write": where the branch writes in the residual stream)
+      or right ("read": what it reads) singular vectors of the attention and MLP Jacobians,
+      k = max(1, d // 8) as activation_geometry's subspace_overlap; mean over tokens.
+    Same assumptions as branch_grad_interval.
+    """
+
+    branch_probe_sequences: int = 8
+    """Tokens (one per probe sequence) for branch_probe_interval's Jacobian overlap."""
+
     attention_stats_interval: int = 1
     """
-    Compute track_max_attention_logit / track_attention_entropy every this many iterations (they
-    recompute the full attention matrix, so they add noticeable time per step).
+    Compute track_max_attention_logit / track_attention_entropy / track_qk_norms every this many
+    iterations (the first two recompute the full attention matrix, so they add noticeable time per
+    step).
     """
 
     geometric_metrics_interval: int = 0
@@ -860,6 +909,20 @@ class NeoXArgsLogging(NeoXArgsTemplate):
     """
     Log the mean output logit over tokens and (padded) vocab during training (Wortsman et al.
     2024, Fig. G.2), as "output logit mean". Assumes model_parallel_size == 1.
+    """
+
+    numeric_stats_interval: int = 0
+    """
+    Every this many iterations (0 = off), log fp16-range and output-logit statistics of that
+    iteration's first training micro-batch (megatron/numeric_stats.py):
+    - "numerics/<point>/{absmax, frac above 2^15, frac subnormal, frac nonfinite}" for the embedding
+      output, every block's input_layernorm / post_attention_layernorm / attention / mlp outputs and
+      residual stream, the final norm and the logits (fp16 max is 65504; subnormals are below 2^-14);
+    - "output logit max abs", "output logit std" (over the vocab, mean over tokens) and "output logit
+      norm" (L2 over the vocab, mean over tokens) (Chen et al. 2026, arXiv:2610.38277);
+    - from the weights: "output embedding mean norm" (norm of the mean row of the unembedding, whose
+      drift under Adam shifts every logit) and "numerics/<norm>/{gain, bias} absmax" per LayerNorm.
+    Assumes model_parallel_size == 1 and no pipeline parallelism.
     """
 
     log_gradient_noise_scale: bool = False

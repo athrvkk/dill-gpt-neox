@@ -42,6 +42,8 @@ from megatron.utils import (
 
 from megatron import print_rank_0, mpu
 from megatron import activation_geometry
+from megatron.numeric_stats import NumericStats
+from megatron.branch_metrics import BranchGradSimilarity, BranchProbe
 from megatron.model import (
     GPT2ModelPipe,
     SoftEmbedding,
@@ -1345,12 +1347,17 @@ def backward_step(neox_args, timers, optimizer, model, loss):
 
 def attention_layers_to_track(neox_args, model):
     """
-    The attention layers whose stats (track_max_attention_logit / track_attention_entropy) to
-    track this iteration, per attention_stats_interval, or [] when nothing is tracked. train_step
-    turns tracking on for these with set_attention_stats_tracking() during forward passes only, and
-    reads the stats with collect_attention_stats().
+    The attention layers whose stats (track_max_attention_logit / track_attention_entropy /
+    track_qk_norms) to track this iteration, per attention_stats_interval, or [] when nothing is
+    tracked. train_step turns tracking on for these with set_attention_stats_tracking() during
+    forward passes only, and reads the stats with collect_attention_stats().
     """
-    if not (neox_args.track_max_attention_logit or neox_args.track_attention_entropy):
+    if not (
+        neox_args.track_max_attention_logit
+        or neox_args.track_attention_entropy
+        or neox_args.track_qk_norms
+        or neox_args.track_attention_logits_per_head
+    ):
         return []
     # neox_args.iteration is the number of completed steps; this step is logged as iteration + 1.
     if ((neox_args.iteration or 0) + 1) % neox_args.attention_stats_interval != 0:
@@ -1370,14 +1377,15 @@ def set_attention_stats_tracking(attention_layers, on):
 
 def collect_attention_stats(attention_layers):
     """
-    Per-layer stats since the last call, as "block NN/max attention logit" (max over
-    micro-batches and data-parallel ranks) and "block NN/attention entropy" (mean), OLMo-core's names.
+    Per-layer stats since the last call, as "block NN/<name>": "max ..." stats (e.g. OLMo-core's
+    "max attention logit") are maxima over micro-batches and data-parallel ranks, the others
+    ("attention entropy", "query norm", ...) means.
     """
     stats = {}
     for layer in attention_layers:
         for name, value in layer.compute_attention_stats().items():
             value = value.detach().clone()
-            if name == "max attention logit":
+            if name.split("/")[-1].startswith("max "):
                 torch.distributed.all_reduce(value, op=torch.distributed.ReduceOp.MAX)
             else:
                 value = reduce_losses([value]).mean()
@@ -1410,6 +1418,12 @@ def geometric_metric_matrices(model):
         for name, param in model.module.named_parameters()
         if param.ndim == 2
     ]
+
+
+# compute_mtrx_geometric_metrics keys not logged for the weights: sing_sum = nuc_norm, sing_mean =
+# nuc_norm / d, classical_rank is always full for these matrices, and determinant (sum of log singular
+# values) is dominated by the smallest singular values (condition_number / effective_rank cover it).
+GEOMETRY_NOT_LOGGED = {"sing_sum", "sing_mean", "classical_rank", "determinant"}
 
 
 def log_geometric_metrics(neox_args, model, iteration):
@@ -1450,6 +1464,8 @@ def log_geometric_metrics(neox_args, model, iteration):
                 )
                 continue
             for name, value in metrics.items():
+                if name in GEOMETRY_NOT_LOGGED:
+                    continue
                 tb_wandb_log(
                     f"geometry/{label}/{name}",
                     value,
@@ -1482,6 +1498,58 @@ def activation_capture_due(neox_args):
     return _activation_capture
 
 
+# The NumericStats of the current train() call (numeric_stats_interval), or None.
+_numeric_stats = None
+# The BranchGradSimilarity (branch_grad_interval) and BranchProbe (branch_probe_interval), or None.
+_branch_grads = None
+_branch_probe = None
+
+
+def branch_grads_due(neox_args):
+    """The BranchGradSimilarity to fill during this iteration's first micro-batch, or None."""
+    interval = neox_args.branch_grad_interval
+    if _branch_grads is None or not interval or ((neox_args.iteration or 0) + 1) % interval:
+        return None
+    return _branch_grads
+
+
+def log_branch_probe(neox_args, model, probe_batch, iteration):
+    """Run BranchProbe on the probe batch and log its metrics (see megatron/branch_metrics.py)."""
+    start = time.time()
+
+    def forward():
+        _, metrics = forward_step(
+            data_iterator=iter([probe_batch]), model=model, neox_args=neox_args, timers=None
+        )
+        return metrics["CE loss"]
+
+    metrics = _branch_probe.run(model, forward)
+    if neox_args.deepspeed and neox_args.deepspeed_activation_checkpointing:
+        deepspeed.checkpointing.reset()  # as evaluate() does after forward-only passes
+    for key, value in metrics.items():
+        tb_wandb_log(
+            key,
+            value.item(),
+            iteration,
+            use_wandb=neox_args.use_wandb,
+            tensorboard_writer=neox_args.tensorboard_writer,
+            comet_experiment=neox_args.comet_experiment,
+        )
+    print_rank_0(
+        f"branch probe at iteration {iteration} took {time.time() - start:.1f}s: "
+        + ", ".join(f"{k.removeprefix('branch/')}={v.item():.4g}" for k, v in list(metrics.items())[:5])
+    )
+
+
+def numeric_stats_due(neox_args):
+    """The NumericStats to fill during this iteration's first forward pass, or None."""
+    interval = neox_args.numeric_stats_interval
+    # neox_args.iteration is the number of completed steps; this step is logged as iteration + 1.
+    if _numeric_stats is None or not interval or ((neox_args.iteration or 0) + 1) % interval:
+        return None
+    return _numeric_stats
+
+
 def log_activation_geometry(neox_args, capture, iteration, prefix):
     """Log the metrics of the capture's last forward pass as "<prefix>/<label>/<metric>"."""
     start = time.time()
@@ -1506,11 +1574,11 @@ def log_activation_geometry(neox_args, capture, iteration, prefix):
 
 
 def take_probe_batch(valid_data_iterator):
-    """The first validation micro-batch (activation_probe_interval), consumed from the iterator."""
+    """The first validation micro-batch (activation_probe_interval, branch_probe_interval), consumed from the iterator."""
     if isinstance(valid_data_iterator, dict):  # named validation sets: the first one
         valid_data_iterator = next(iter(valid_data_iterator.values()), None)
     if valid_data_iterator is None:
-        raise ValueError("activation_probe_interval needs validation data (valid-data-paths)")
+        raise ValueError("activation_probe_interval / branch_probe_interval need validation data (valid-data-paths)")
     return next(valid_data_iterator)
 
 
@@ -1566,12 +1634,18 @@ def train_step(
         nonfinite_skip = False
         attention_layers = attention_layers_to_track(neox_args, model)
         activation_capture = activation_capture_due(neox_args)
+        numeric_stats = numeric_stats_due(neox_args)
+        branch_grads = branch_grads_due(neox_args)
         for micro_batch in range(neox_args.gradient_accumulation_steps):
             # Forward model for one step.
             timers("forward").start()
             set_attention_stats_tracking(attention_layers, True)
             if activation_capture is not None and micro_batch == 0:
                 activation_capture.start(seed=activation_seed(neox_args, (neox_args.iteration or 0) + 1))
+            if numeric_stats is not None and micro_batch == 0:
+                numeric_stats.start()
+            if branch_grads is not None and micro_batch == 0:
+                branch_grads.start()
             loss, metric_dict = forward_step(
                 neox_args=neox_args,
                 timers=timers,
@@ -1584,6 +1658,10 @@ def train_step(
             set_attention_stats_tracking(attention_layers, False)
             if activation_capture is not None:
                 activation_capture.stop()
+            if numeric_stats is not None:
+                numeric_stats.stop()
+            if branch_grads is not None:
+                branch_grads.stop()  # its gradients arrive in this micro-batch's backward
             timers("forward").stop()
             losses.append(loss)
             for key in metric_dict.keys():
@@ -1674,6 +1752,10 @@ def train_step(
                 float(grad_norm), device=torch.cuda.current_device()
             )
         reduce_metrics.update(collect_attention_stats(attention_layers))
+        if numeric_stats is not None:
+            reduce_metrics.update(numeric_stats.compute())
+        if branch_grads is not None:
+            reduce_metrics.update(branch_grads.compute())
 
     if neox_args.precision == "fp16" and model.optimizer.overflow:
         skipped_iter = 1
@@ -1776,17 +1858,24 @@ def train(
             log_geometric_metrics(neox_args, model, iteration)
             timers("interval time").start()
 
-    global _activation_capture
+    global _activation_capture, _numeric_stats, _branch_grads, _branch_probe
     _activation_capture = None
+    _numeric_stats = NumericStats(model, neox_args) if neox_args.numeric_stats_interval else None
+    _branch_grads = BranchGradSimilarity(model, neox_args) if neox_args.branch_grad_interval else None
+    _branch_probe = BranchProbe(model, neox_args) if neox_args.branch_probe_interval else None
     probe_batch = None
+    if neox_args.activation_probe_interval or neox_args.branch_probe_interval:
+        probe_batch = take_probe_batch(valid_data_iterator)
     if neox_args.activation_geometry_interval or neox_args.activation_probe_interval:
         _activation_capture = activation_geometry.ActivationCapture(model, neox_args)
-        if neox_args.activation_probe_interval:
-            probe_batch = take_probe_batch(valid_data_iterator)
-            if iteration == 0:  # the probe at initialization
-                timers("interval time").stop()
-                log_activation_probe(neox_args, model, _activation_capture, probe_batch, iteration)
-                timers("interval time").start()
+        if neox_args.activation_probe_interval and iteration == 0:  # the probe at initialization
+            timers("interval time").stop()
+            log_activation_probe(neox_args, model, _activation_capture, probe_batch, iteration)
+            timers("interval time").start()
+    if _branch_probe is not None and iteration == 0:  # at initialization
+        timers("interval time").stop()
+        log_branch_probe(neox_args, model, probe_batch, iteration)
+        timers("interval time").start()
 
     if neox_args.profile:
         schedule = torch.profiler.schedule(
@@ -1877,6 +1966,11 @@ def train(
         ):
             timers("interval time").stop()
             log_activation_probe(neox_args, model, _activation_capture, probe_batch, iteration)
+            timers("interval time").start()
+
+        if neox_args.branch_probe_interval and iteration % neox_args.branch_probe_interval == 0:
+            timers("interval time").stop()
+            log_branch_probe(neox_args, model, probe_batch, iteration)
             timers("interval time").start()
 
         # Checkpointing
