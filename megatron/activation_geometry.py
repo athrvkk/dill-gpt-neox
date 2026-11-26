@@ -202,6 +202,24 @@ def branch_metrics(attention, mlp):
     )
 
 
+def _finite(x):
+    if isinstance(x, dict):
+        return all(_finite(v) for v in x.values())
+    return not torch.is_tensor(x) or bool(torch.isfinite(x).all())
+
+
+def _or_nan(n, fn, *args):
+    """fn(*args), or n NaNs if an input is non-finite (e.g. after an fp16 overflow) or fn fails (an
+    eigendecomposition that doesn't converge), so a diverging run keeps training. Purely local: every
+    rank still reaches compute()'s all-reduce."""
+    if all(_finite(a) for a in args):
+        try:
+            return fn(*args)
+        except RuntimeError as e:
+            print(f"activation geometry: {fn.__name__} failed ({e!r}); logging NaN", flush=True)
+    return torch.full((n,), float("nan"), dtype=torch.float64)
+
+
 class ActivationCapture:
     """
     Forward hooks that sample activation_geometry_tokens token positions from every capture point
@@ -333,12 +351,13 @@ class ActivationCapture:
             keys, values = [], []
             for label in self.labels():
                 keys += [f"{label}/{name}" for name in MATRIX_METRICS]
-                values.append(metrics_from_summary(summaries[label]))
+                values.append(_or_nan(len(MATRIX_METRICS), metrics_from_summary, summaries[label]))
             for number in self.layer_numbers:
                 prefix = f"block {number:02d}"
                 keys += [f"{prefix}/branch/{name}" for name in BRANCH_METRICS]
-                values.append(branch_metrics_from_summaries(
-                    branches[number], summaries[f"{prefix}/attention"], summaries[f"{prefix}/mlp"]
+                values.append(_or_nan(
+                    len(BRANCH_METRICS), branch_metrics_from_summaries,
+                    branches[number], summaries[f"{prefix}/attention"], summaries[f"{prefix}/mlp"],
                 ))
             values = torch.cat(values)
             if torch.distributed.is_initialized() and torch.distributed.get_world_size() > 1:

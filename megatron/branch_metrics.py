@@ -135,8 +135,14 @@ def jacobians(fn, r, positions):
 def subspace_overlaps(ja, jm):
     """Mean over tokens of the top-k left (write) and right (read) singular-subspace overlaps."""
     k = max(1, ja.shape[-1] // 8)
-    ua, _, vha = torch.linalg.svd(ja)
-    um, _, vhm = torch.linalg.svd(jm)
+    nan = torch.tensor(float("nan"), device=ja.device)
+    if not (torch.isfinite(ja).all() and torch.isfinite(jm).all()):  # e.g. after an fp16 overflow
+        return nan, nan
+    try:
+        ua, _, vha = torch.linalg.svd(ja)
+        um, _, vhm = torch.linalg.svd(jm)
+    except RuntimeError:  # no convergence: NaN rather than a crash (purely local, before the all-reduce)
+        return nan, nan
     write = (ua[..., :k].transpose(-1, -2) @ um[..., :k]).pow(2).sum((-1, -2)) / k
     read = (vha[..., :k, :] @ vhm[..., :k, :].transpose(-1, -2)).pow(2).sum((-1, -2)) / k
     return write.mean(), read.mean()

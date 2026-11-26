@@ -794,6 +794,18 @@ class NeoXArgsLogging(NeoXArgsTemplate):
     Log the frob norm of the optimizer states to wandb / tensorboard (useful for debugging).
     """
 
+    exit_on_repeated_overflow: bool = True
+    """
+    Exit when 50 iterations in a row are skipped for fp16 overflow (NeoX's default). False: warn once per
+    such streak and keep training to train_iters (the skipped steps don't change the weights).
+    """
+
+    optimizer_stats_interval: int = 1
+    """
+    Log log_optimizer_states / log_param_norm / log_grad_norm / log_grad_pct_zeros every this many
+    iterations (1 = every step, as before).
+    """
+
     track_max_attention_logit: bool = False
     """
     Log the max pre-softmax attention logit <q, k> * scale over causal positions per layer during

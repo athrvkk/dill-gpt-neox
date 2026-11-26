@@ -1839,7 +1839,7 @@ def train(
     noise_scale_logger = get_noise_scale_logger(neox_args)
 
     # to monitor if we've skipped many iterations in a row and trigger an early exit
-    overflow_monitor = OverflowMonitor(optimizer)
+    overflow_monitor = OverflowMonitor(optimizer, exit_on_overflow=neox_args.exit_on_repeated_overflow)
 
     if neox_args.geometric_metrics_interval:
         # Fail now rather than at the first logging interval.

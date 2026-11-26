@@ -360,8 +360,9 @@ def training_log(
                 comet_experiment=neox_args.comet_experiment,
             )
 
-    # (optional) Log optimizer states to wandb / tb every step
-    if neox_args.log_optimizer_states:
+    # (optional) Log optimizer states / grad and param norms every optimizer_stats_interval steps
+    log_stats_now = iteration % neox_args.optimizer_stats_interval == 0
+    if neox_args.log_optimizer_states and log_stats_now:
         for k, v in optimizer.state_dict()["optimizer_state_dict"]["state"].items():
             for ki, vi in v.items():  # step, module
                 if ki != "step":
@@ -375,12 +376,11 @@ def training_log(
                         comet_experiment=neox_args.comet_experiment,
                     )
 
-    # (optional) Log grad/param norms to wandb / tb every step
     if (
         neox_args.log_grad_pct_zeros
         or neox_args.log_grad_norm
         or neox_args.log_param_norm
-    ):
+    ) and log_stats_now:
         if neox_args.log_grad_pct_zeros or neox_args.log_grad_norm:
             model.store_gradients = True  # start storing gradients
 
