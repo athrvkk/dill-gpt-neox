@@ -356,39 +356,28 @@ def expand_attention_types(attention_config, num_layers):
 class OverflowMonitor:
 
     """
-    Checks if the past n iterations have been skipped due to overflow, and exits training if that
-    happens (or, with exit_on_overflow=False, warns once per such streak and keeps training).
+    Checks if the past n iterations have been skipped due to overflow, and exits
+    training if that happens.
     """
 
-    def __init__(self, optimizer, n=50, exit_on_overflow=True):
+    def __init__(self, optimizer, n=50):
         self.optimizer = optimizer
         self.n = n
         self.history = deque(maxlen=n)
         self.bf16 = isinstance(optimizer, BF16_Optimizer)
-        self.exit_on_overflow = exit_on_overflow
-        self.warned = False
 
     def check(self, skipped):
         if self.bf16:
             return
         self.history.append(skipped)
-        if not skipped:
-            self.warned = False
         if (
             self.optimizer.overflow
             and len(self.history) == self.n
             and all(self.history)
         ):
-            if self.exit_on_overflow:
-                raise Exception(
-                    f"Skipped {self.n} iterations in a row due to Overflow - Exiting training."
-                )
-            if not self.warned:
-                print_rank_0(
-                    f"WARNING: skipped {self.n} iterations in a row due to overflow; continuing "
-                    f"(exit_on_repeated_overflow is false). Further skips in this streak are not reported."
-                )
-                self.warned = True
+            raise Exception(
+                f"Skipped {self.n} iterations in a row due to Overflow - Exiting training."
+            )
 
 
 def get_noise_scale_logger(neox_args):
