@@ -1914,8 +1914,7 @@ def train(
             prof.stop()
         iteration += 1
         neox_args.iteration = iteration
-        if neox_args.precision == "fp16":
-            overflow_monitor.check(skipped_iter)  # check for repeated overflow
+        overflow_monitor.check(skipped_iter)  # exit on a long streak of skipped steps (fp16 overflow / bf16 NaN)
         if neox_args.log_gradient_noise_scale:  # log noise scale if applicable
             noise_scale_logger.update()
 

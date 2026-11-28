@@ -796,7 +796,8 @@ class NeoXArgsLogging(NeoXArgsTemplate):
 
     exit_on_repeated_overflow: int = 1000
     """
-    Exit training when this many iterations in a row are skipped for fp16 overflow (stock NeoX: 50).
+    Exit training when this many iterations in a row are skipped: fp16 loss-scaler overflow (stock NeoX: 50), or in
+    bf16 a NaN/inf/zero global grad norm (the update is dropped; stock NeoX never exits for bf16). 0 disables it.
     """
 
     optimizer_stats_interval: int = 1

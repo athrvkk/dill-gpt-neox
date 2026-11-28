@@ -356,27 +356,23 @@ def expand_attention_types(attention_config, num_layers):
 class OverflowMonitor:
 
     """
-    Checks if the past n iterations have been skipped due to overflow, and exits
-    training if that happens.
+    Exits training if the past n iterations were all skipped: fp16 loss-scaler overflow, or (bf16, which has no
+    loss scaler) a NaN/inf/zero global grad norm that train_step dropped the update for. n <= 0 disables it.
     """
 
     def __init__(self, optimizer, n=50):
-        self.optimizer = optimizer
         self.n = n
-        self.history = deque(maxlen=n)
-        self.bf16 = isinstance(optimizer, BF16_Optimizer)
+        self.history = deque(maxlen=max(n, 1))
+        self.reason = ("non-finite gradients (NaN/inf/zero grad norm)" if isinstance(optimizer, BF16_Optimizer)
+                       else "Overflow")
 
     def check(self, skipped):
-        if self.bf16:
+        if self.n <= 0:
             return
         self.history.append(skipped)
-        if (
-            self.optimizer.overflow
-            and len(self.history) == self.n
-            and all(self.history)
-        ):
+        if len(self.history) == self.n and all(self.history):
             raise Exception(
-                f"Skipped {self.n} iterations in a row due to Overflow - Exiting training."
+                f"Skipped {self.n} iterations in a row due to {self.reason} - Exiting training."
             )
 
 
